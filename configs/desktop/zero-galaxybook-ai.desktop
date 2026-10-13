@@ -1,0 +1,15 @@
+[Desktop Entry]
+Name=Zero Galaxy Book AI (Studio Camera Effects)
+Name[pt_BR]=Zero Galaxy Book AI (Efeitos de Câmera)
+GenericName=AI Studio Camera
+GenericName[pt_BR]=Câmera com Inteligência Artificial
+Comment=Real-time AI Studio Effects: Background Blur, Auto-Framing & Virtual Background
+Comment[pt_BR]=Efeitos de Estúdio: Desfoque de Fundo, Auto-Framing e Fundo Virtual em tempo real
+Exec=zero-linux-broadcast
+Icon=camera-video
+Type=Application
+Terminal=false
+StartupNotify=true
+StartupWMClass=LinuxBroadcast
+Categories=AudioVideo;Video;Utility;
+Keywords=Camera;Webcam;AI;Studio;Blur;Framing;GalaxyBook;Zero;

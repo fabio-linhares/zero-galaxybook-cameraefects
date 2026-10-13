@@ -1,0 +1,80 @@
+[graph]
+targets = [{ triple = "x86_64-unknown-linux-gnu" }]
+
+[advisories]
+version = 2
+yanked = "deny"
+# Unmaintained advisories pulled in transitively via `tray-icon` →
+# gtk-rs 0.18 (gtk3) and its proc-macro-error / paste deps. The
+# upstream tray-icon crate has not migrated to gtk-rs 0.20 yet, and the
+# Linux system-tray story for libayatana-appindicator still requires
+# the GTK3 bindings. Revisit when tray-icon publishes a gtk-rs 0.20
+# release or switches to a non-GTK approach.
+ignore = [
+    "RUSTSEC-2024-0370", # proc-macro-error
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0413", # atk
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0416", # atk-sys
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0419", # gtk3-macros
+    "RUSTSEC-2024-0420", # gtk-sys
+    "RUSTSEC-2024-0436", # paste
+
+    # Reached only through build-time or bundled-asset paths, never from
+    # untrusted input.
+    #
+    # quick-xml is pulled in by the `wayland-scanner` proc-macro, which parses
+    # the Wayland protocol XML shipped inside that crate at build time. It is
+    # held below the fixed 0.41 by wayland-scanner's own requirement and is not
+    # present at runtime.
+    "RUSTSEC-2026-0194", # quick-xml
+    "RUSTSEC-2026-0195", # quick-xml
+
+    # ttf-parser is egui's font parser (via ab_glyph/epaint), reading the fonts
+    # bundled with the binary. Flagged unmaintained rather than vulnerable; no
+    # upgrade exists.
+    "RUSTSEC-2026-0192", # ttf-parser
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-or-later",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# Ubuntu Font License is bundled by egui's default fonts but not in
+# SPDX, so cargo-deny refuses to evaluate the license expression
+# unmodified. Clarify the expression to drop the LicenseRef-UFL-1.0
+# clause; the matching font file (Ubuntu-Light.ttf) is unused — egui
+# defaults pick the OFL-1.1 fonts (Hack, NotoEmoji-Regular).
+[[licenses.clarify]]
+crate = "epaint_default_fonts"
+expression = "(MIT OR Apache-2.0) AND OFL-1.1"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

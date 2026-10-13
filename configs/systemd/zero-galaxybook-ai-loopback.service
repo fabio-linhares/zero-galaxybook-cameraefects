@@ -1,0 +1,12 @@
+[Unit]
+Description=Virtual V4L2 Loopback Device for Zero Galaxy Book AI Camera
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'test -e /dev/video40 || /usr/bin/v4l2loopback-ctl add -n "Zero Galaxy Book AI Camera" -x 1 40'
+ExecStop=/usr/bin/v4l2loopback-ctl delete /dev/video40
+
+[Install]
+WantedBy=multi-user.target

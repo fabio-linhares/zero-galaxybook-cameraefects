@@ -1,0 +1,69 @@
+name: AUR PKGBUILD lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/aur/**"
+      - "packaging/aur-cuda/**"
+      - ".github/workflows/aur-lint.yml"
+  pull_request:
+    paths:
+      - "packaging/aur/**"
+      - "packaging/aur-cuda/**"
+      - ".github/workflows/aur-lint.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Validate PKGBUILD parses and .SRCINFO is in sync
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate PKGBUILD + .SRCINFO
+        run: |
+          set -euo pipefail
+          useradd -m builder
+
+          for dir in packaging/aur packaging/aur-cuda; do
+            echo "===== validating $dir ====="
+            work="/tmp/$(basename "$dir")"
+            rm -rf "$work"
+            cp -r "$dir" "$work"
+            chown -R builder "$work"
+
+            # makepkg refuses to run as root.
+            su builder -c "cd '$work' && makepkg --printsrcinfo" > /tmp/canonical_srcinfo
+
+            echo "----- canonical .SRCINFO from $dir/PKGBUILD -----"
+            cat /tmp/canonical_srcinfo
+            echo "--------------------------------------------"
+
+            if ! diff -u "$dir/.SRCINFO" /tmp/canonical_srcinfo; then
+              echo
+              echo "::error::$dir/.SRCINFO is out of sync with PKGBUILD."
+              echo "Regenerate locally with:"
+              echo "  docker run --rm -v \"\$PWD/$dir:/aur\" archlinux:base-devel bash -c 'useradd -m b && cp -r /aur/. /tmp/aur && chown -R b /tmp/aur && su b -c \"cd /tmp/aur && makepkg --printsrcinfo\"' > $dir/.SRCINFO"
+              exit 1
+            fi
+          done
+
+      - name: Run namcap on PKGBUILD
+        run: |
+          pacman -Sy --noconfirm namcap >/dev/null
+          # namcap reports informational notices on -bin packages (no
+          # build()/check() hooks) — treat as advisory, fail only on
+          # E: errors.
+          for dir in packaging/aur packaging/aur-cuda; do
+            echo "===== namcap $dir/PKGBUILD ====="
+            if namcap "$dir/PKGBUILD" | tee /tmp/namcap.log | grep -E '^[A-Za-z0-9_/.-]+ E:'; then
+              echo "::error::namcap reported errors above for $dir/PKGBUILD."
+              exit 1
+            fi
+            echo "namcap output (advisory):"
+            cat /tmp/namcap.log
+          done

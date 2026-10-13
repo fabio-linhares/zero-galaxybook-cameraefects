@@ -1,0 +1,1094 @@
+//! Lazy producer state machine and feeder thread.
+//!
+//! Owns:
+//! - the `Segmenter`, `Compositor`, and `MaskSmoother`,
+//! - the source GStreamer graph (`v4l2src → … → appsink`) which is
+//!   built when going Live and torn down when going Idle, releasing
+//!   the physical camera so the LED actually goes off,
+//! - the `appsrc` of the always-running sink graph; we push composited
+//!   buffers into it while Live, and push nothing while Idle.
+//!
+//! The feeder runs in one thread. It ticks at ~33 ms while Live (paced
+//! by `try_pull_sample` on the source appsink), and ~100 ms while Idle
+//! (a plain sleep — no frames flow downstream when nobody's reading).
+//!
+//! Transitions are debounced to absorb two real-world quirks:
+//! - Browsers (Chrome / Firefox) briefly open `/dev/video10` to probe
+//!   capabilities (ENUM_FMT) without intending to stream. A short
+//!   activation debounce hides those probes from the camera LED.
+//! - In-call camera-switcher pickers close-and-reopen the device when
+//!   the user toggles between cameras. A short deactivation debounce
+//!   prevents the pipeline from thrashing.
+
+use std::collections::HashSet;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, Sender, select};
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
+
+use crate::compositor::{Background, Compositor, Framing};
+use crate::consumer_watch::Consumer;
+use crate::framing::{AnchorLock, FG_ZOOM, FG_ZOOM_MAX, TOP_HEADROOM};
+use crate::idle_loader::IdleLoader;
+use crate::pipeline::{
+    CaptureInfo, Command, NS_PER_SEC, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
+    SourceCodec, capture_dims, log_negotiated_input,
+};
+use crate::profile::Profiler;
+use crate::segmenter::{Backend, Mask, ModelKind, Segmenter};
+use crate::temporal::{DEFAULT_ALPHA, MaskSmoother, RVM_ALPHA};
+
+/// How long a consumer must remain present before we light the camera.
+/// Sized to reject browser capability-probes (typically <500 ms) without
+/// adding noticeable latency to a real Meet/Zoom open.
+pub(crate) const ACTIVATION_DEBOUNCE: Duration = Duration::from_millis(2_000);
+
+/// How long after the last consumer leaves before we release the camera.
+/// Absorbs the close-and-reopen flicker of in-call camera-switcher
+/// pickers (Chrome's "Camera (LinuxBroadcast)" dropdown).
+pub(crate) const DEACTIVATION_DEBOUNCE: Duration = Duration::from_millis(3_000);
+
+/// Idle-loop tick: how often we check for incoming control / watcher
+/// events when no frames are flowing. 100 ms is fast enough for the
+/// state machine to feel responsive without burning power.
+const IDLE_TICK: Duration = Duration::from_millis(100);
+
+/// While Idle (camera released), the feeder still pushes a frame to the
+/// sink at this rate so consumers always see motion. ~10 Hz keeps the
+/// 8-segment rotating spinner readable (~0.8 s per revolution) without
+/// approaching Live-mode throughput; one tick lag at 100 ms still beats
+/// any WebRTC consumer's "no frames" timeout (typically 1–3 s).
+const IDLE_PUSH_INTERVAL: Duration = Duration::from_millis(90);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum State {
+    Idle,
+    Activating { since: Instant },
+    Live,
+    Deactivating { since: Instant },
+}
+
+/// Inputs that drive the state machine, computed once per tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Demand {
+    pub consumers_present: bool,
+    /// True while the GUI's preview pane is visible. Treated as a
+    /// synthetic consumer so opening the preview lights the camera even
+    /// when no real client is attached to `/dev/video10`.
+    pub gui_preview_active: bool,
+}
+impl Demand {
+    pub(crate) fn signal(&self) -> bool {
+        self.consumers_present || self.gui_preview_active
+    }
+}
+
+/// Pure state-transition function. No side effects. Extracted from
+/// `Feeder::step_state` so the debounce logic can be exercised on a
+/// synthetic `Instant` timeline without booting GStreamer.
+pub(crate) fn next_state(state: State, demand: Demand, now: Instant) -> State {
+    let signal = demand.signal();
+    match (state, signal) {
+        (State::Idle, true) => State::Activating { since: now },
+        (State::Idle, false) => State::Idle,
+
+        (State::Activating { since }, true) => {
+            if now.duration_since(since) >= ACTIVATION_DEBOUNCE {
+                State::Live
+            } else {
+                State::Activating { since }
+            }
+        }
+        (State::Activating { .. }, false) => State::Idle,
+
+        (State::Live, true) => State::Live,
+        (State::Live, false) => State::Deactivating { since: now },
+
+        (State::Deactivating { .. }, true) => State::Live,
+        (State::Deactivating { since }, false) => {
+            if now.duration_since(since) >= DEACTIVATION_DEBOUNCE {
+                State::Idle
+            } else {
+                State::Deactivating { since }
+            }
+        }
+    }
+}
+
+/// What `spawn_feeder` hands back: the feeder thread, the live execution
+/// backend, and the reason for a GPU-to-CPU recovery once one has happened.
+type FeederHandles = (
+    std::thread::JoinHandle<()>,
+    Arc<Mutex<Backend>>,
+    Arc<Mutex<Option<String>>>,
+);
+
+/// Spawn the feeder thread. Returns the join handle plus a stop-flag the
+/// caller (Pipeline) can flip to ask the thread to wind down promptly;
+/// the thread also exits naturally on `Command::Stop` and on cmd-channel
+/// disconnect.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_feeder(
+    cfg: PipelineConfig,
+    multiclass_onnx: &'static [u8],
+    rvm_onnx: &'static [u8],
+    sink_appsrc: gst_app::AppSrc,
+    cmd_rx: Receiver<Command>,
+    watcher_rx: Receiver<Vec<Consumer>>,
+    state_pub: Arc<Mutex<PipelineState>>,
+    stop_flag: Arc<AtomicBool>,
+    source_builder: SourceBuilder,
+) -> Result<FeederHandles> {
+    let model_onnx = match cfg.model {
+        ModelKind::SelfieMulticlass => multiclass_onnx,
+        ModelKind::Rvm => rvm_onnx,
+    };
+    let segmenter =
+        Segmenter::from_bytes(cfg.model, model_onnx).context("load segmentation model")?;
+    let backend = segmenter.backend();
+    let backend_pub = Arc::new(Mutex::new(backend));
+    let gpu_fallback_pub = Arc::new(Mutex::new(None));
+    let backend_pub_for_thread = Arc::clone(&backend_pub);
+    let gpu_fallback_pub_for_thread = Arc::clone(&gpu_fallback_pub);
+
+    let idle_loader = IdleLoader::new(cfg.width, cfg.height);
+
+    // Inference cadence: run segmentation once every N Live ticks and
+    // reuse the cached mask on the skipped ticks. 1 = infer every frame
+    // (full quality, RVM-bound output FPS). 2 = infer every other frame
+    // (~half the inference cost, output FPS bound by composite instead;
+    // mask lags the frame by up to one tick during motion). Clamped to
+    // ≥1. Overridable at runtime via `LB_INFER_INTERVAL`.
+    let infer_interval = std::env::var("LB_INFER_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+
+    let cfg_for_thread = cfg.clone();
+    let handle = std::thread::Builder::new()
+        .name("lb-feeder".into())
+        .spawn(move || {
+            let mut feeder = Feeder {
+                cfg: cfg_for_thread,
+                segmenter,
+                model_onnx,
+                backend_pub: backend_pub_for_thread,
+                gpu_fallback_pub: gpu_fallback_pub_for_thread,
+                compositor: Compositor::new(),
+                smoother: MaskSmoother::new(match cfg.model {
+                    ModelKind::Rvm => RVM_ALPHA,
+                    _ => DEFAULT_ALPHA,
+                }),
+                anchor_lock: AnchorLock::new(),
+                framing_enabled: cfg.framing,
+                background: cfg.background.clone(),
+                preview_tx: cfg.preview_tx.clone(),
+                sink_appsrc,
+                source: None,
+                source_builder,
+                resolved_codec: std::env::var_os("LB_FORCE_RAW").map(|_| SourceCodec::Raw),
+                live_fps: None,
+                capture_info: None,
+                fps_win_start: Instant::now(),
+                fps_win_frames: 0,
+                telemetry_dirty: false,
+                consumers: Vec::new(),
+                preview_enabled: true,
+                gui_preview_active: false,
+                state: State::Idle,
+                state_pub,
+                frame_idx: 0,
+                last_state_log: None,
+                start_failure_count: 0,
+                start_failure_backoff_until: None,
+                last_published_pids: HashSet::new(),
+                idle_loader,
+                idle_frame: None,
+                last_idle_push: None,
+                infer_interval,
+                infer_tick: 0,
+                cached_mask: None,
+                cached_framing: None,
+                profiler: Profiler::new(infer_interval),
+            };
+            feeder.run(cmd_rx, watcher_rx, stop_flag);
+        })
+        .context("spawn lb-feeder")?;
+    Ok((handle, backend_pub, gpu_fallback_pub))
+}
+
+struct Feeder {
+    cfg: PipelineConfig,
+    segmenter: Segmenter,
+    /// Bytes of the selected model, retained so a delayed CUDA failure can
+    /// rebuild the same model with the CPU execution provider.
+    model_onnx: &'static [u8],
+    /// Live backend status published to the GUI. Unlike session creation,
+    /// CUDA compatibility is only proven after the first inference.
+    backend_pub: Arc<Mutex<Backend>>,
+    /// One-shot user-facing explanation emitted when GPU inference fails and
+    /// the feeder continues on CPU.
+    gpu_fallback_pub: Arc<Mutex<Option<String>>>,
+    compositor: Compositor,
+    smoother: MaskSmoother,
+    /// Smoothed virtual-PTZ crop driver. Held even when `framing_enabled`
+    /// is false so toggling at runtime doesn't drop history more than the
+    /// explicit `reset()` we run on disable.
+    anchor_lock: AnchorLock,
+    /// Toggle for the auto-frame stage. When true, segmentation runs on
+    /// every frame regardless of background mode (the smoother needs a
+    /// mask to compute the bbox), and the compositor's crop+rescale stage
+    /// runs after compositing.
+    framing_enabled: bool,
+    background: Background,
+    preview_tx: Option<Sender<PreviewFrame>>,
+    sink_appsrc: gst_app::AppSrc,
+    /// Builder for the source GST graph. Production wires
+    /// `pipeline::build_source_pipeline`; tests substitute a synthetic
+    /// builder. Called on every Live engagement.
+    source_builder: SourceBuilder,
+    /// Capture codec resolved by the first successful `start_source`.
+    /// `None` until then; afterwards every Live engagement reuses it, so
+    /// a raw-only camera pays the failed-MJPEG probe only once per
+    /// process. Forced to `Raw` up-front when `LB_FORCE_RAW` is set.
+    resolved_codec: Option<SourceCodec>,
+    /// Source GST graph + its appsink; only `Some` while Live.
+    source: Option<(gst::Pipeline, gst_app::AppSink)>,
+    /// Measured output framerate (rolling ~1 s window), published to the
+    /// GUI. `None` until the first window completes; cleared on Live exit.
+    live_fps: Option<f32>,
+    /// Native camera capture format, read from the `v4l2src` src pad once
+    /// per Live engagement. Cleared on Live exit.
+    capture_info: Option<CaptureInfo>,
+    /// Rolling fps-window start and frame count. Always-on (independent of
+    /// `LB_PROFILE`); cheap (one increment + one `Instant` compare/frame).
+    fps_win_start: Instant,
+    fps_win_frames: u32,
+    /// Set when `live_fps`/`capture_info` change so `publish_state` knows to
+    /// re-publish despite no state/consumer change. Cleared after publish.
+    telemetry_dirty: bool,
+    consumers: Vec<Consumer>,
+    /// Mirrors the GUI's "Show preview" toggle. When false, frames are
+    /// not forwarded to `preview_tx` (skips a 1280×720 RGBA clone per
+    /// frame). Defaults to true so any standalone consumer of the
+    /// pipeline (tests, future headless tooling) gets frames by default.
+    preview_enabled: bool,
+    /// True while the GUI's preview pane is visible (window visible AND
+    /// `show_preview` toggle on). Acts as a synthetic consumer in the
+    /// lazy state machine. Defaults to false so headless launches and
+    /// any non-GUI caller don't keep the camera lit by accident.
+    gui_preview_active: bool,
+    state: State,
+    state_pub: Arc<Mutex<PipelineState>>,
+    frame_idx: u64,
+    last_state_log: Option<&'static str>,
+    /// Number of consecutive `start_source` failures. Drives an
+    /// exponential backoff so a wedged camera doesn't produce a 10 Hz
+    /// log flood. Reset to 0 on success.
+    start_failure_count: u32,
+    /// While `Some(t)` and `now < t`, the state machine refuses to leave
+    /// Idle even if demand is asserted. Cleared on natural expiry or on
+    /// a successful `start_source`.
+    start_failure_backoff_until: Option<Instant>,
+    /// PIDs included in the most recent `state_pub` write. Used to skip
+    /// redundant publishes when nothing the GUI cares about has changed.
+    last_published_pids: HashSet<u32>,
+    /// Procedural drawer for the Idle-state frame. Produces a dark
+    /// background + LinuxBroadcast logo + rotating spinner directly
+    /// into `idle_frame` on every tick — replaces the historical
+    /// "re-push last live frame" path, which leaked the previous
+    /// call's image into the next session.
+    idle_loader: IdleLoader,
+    /// Scratch buffer the idle loader renders into. Owned across pushes
+    /// so we keep one heap allocation instead of one per tick.
+    idle_frame: Option<Vec<u8>>,
+    /// Last time `pump_idle_frame` actually pushed a buffer. Used to
+    /// throttle to `IDLE_PUSH_INTERVAL` regardless of how often the
+    /// outer select wakes up.
+    last_idle_push: Option<Instant>,
+    /// Run segmentation once every `infer_interval` Live ticks; reuse the
+    /// cached mask on the rest. 1 = infer every frame.
+    infer_interval: u64,
+    /// Live-tick counter driving the inference cadence. Reset on every
+    /// Live exit so each engagement re-infers on its first frame.
+    infer_tick: u64,
+    /// Most recent smoothed mask, reused on ticks that skip inference.
+    /// `None` until the first inference of a Live engagement (and after
+    /// every Live exit), which forces an inference regardless of cadence.
+    cached_mask: Option<Mask>,
+    /// Auto-frame transform that accompanied `cached_mask`, reused on the
+    /// same skipped ticks so framing stays consistent with the mask.
+    cached_framing: Option<Framing>,
+    /// Per-stage timing, active only under `LB_PROFILE`.
+    profiler: Profiler,
+}
+
+impl Feeder {
+    fn run(
+        &mut self,
+        cmd_rx: Receiver<Command>,
+        watcher_rx: Receiver<Vec<Consumer>>,
+        stop_flag: Arc<AtomicBool>,
+    ) {
+        while !stop_flag.load(Ordering::Relaxed) {
+            // 1. Multiplex control inputs. The parking time depends on
+            //    state: while Live we must NOT sleep here — `pump_one_frame`
+            //    blocks on the source appsink's `try_pull_sample`, which is
+            //    our real pace-maker (≈ camera framerate). Parking the full
+            //    `IDLE_TICK` between Live frames would cap output at
+            //    `1000/IDLE_TICK` fps (10 fps) regardless of how fast the
+            //    segment/composite stages run. While not Live there are no
+            //    frames to pull, so we park for one tick to stay responsive
+            //    to control/watcher events and observe debounce expiry
+            //    without spinning.
+            let park = if matches!(self.state, State::Live) {
+                Duration::ZERO
+            } else {
+                IDLE_TICK
+            };
+            select! {
+                recv(cmd_rx) -> msg => match msg {
+                    Ok(Command::Stop) => return self.shutdown(),
+                    Ok(cmd) => self.handle_command(cmd),
+                    Err(_) => return self.shutdown(),
+                },
+                recv(watcher_rx) -> msg => match msg {
+                    Ok(c) => self.consumers = c,
+                    Err(_) => {
+                        // Watcher exited unexpectedly — keep the pipeline
+                        // running but we won't transition out of Idle
+                        // without force-on / preview signals.
+                        log::warn!("consumer watcher disconnected");
+                    }
+                },
+                default(park) => {}
+            }
+
+            // 2. Step the state machine. Transitions may build / drop
+            //    the source GST graph as a side-effect.
+            let now = Instant::now();
+            self.step_state(now);
+
+            // 3. Frame pumping. Live: pull a real frame from the source
+            //    appsink, segment + composite, push to the sink. Otherwise:
+            //    re-push the last live frame (or black) at a low rate so
+            //    `/dev/video10` always has output for any consumer that
+            //    opens it — the lazy state still controls whether
+            //    `/dev/video0` is held, but virtual-cam visibility is no
+            //    longer gated on consumer detection.
+            if matches!(self.state, State::Live) {
+                self.pump_one_frame();
+            } else {
+                self.pump_idle_frame();
+            }
+        }
+        self.shutdown();
+    }
+
+    fn handle_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::SetBackground(bg) => self.background = bg,
+            Command::SetPreviewEnabled(v) => self.preview_enabled = v,
+            Command::SetGuiPreviewActive(v) => self.gui_preview_active = v,
+            Command::SetFraming(v) => {
+                self.framing_enabled = v;
+                if !v {
+                    // Drop the smoother state so the next enable starts at
+                    // the live bbox instead of panning from a stale rect.
+                    self.anchor_lock.reset();
+                }
+                // Drop the cached framing either way so skipped-inference
+                // ticks don't keep applying a stale crop after the toggle.
+                self.cached_framing = None;
+            }
+            Command::Stop => unreachable!("handled in run()"),
+        }
+    }
+
+    /// Step the debounced state machine and execute side effects
+    /// (build/drop the source pipeline, publish state). Idempotent
+    /// inside a single state.
+    fn step_state(&mut self, now: Instant) {
+        // Backoff gate: a recent `start_source` failure pins us in Idle
+        // until the timer expires, regardless of demand. Without this,
+        // a wedged camera produced a Deactivating ↔ Live retry loop at
+        // tick rate.
+        if let Some(t) = self.start_failure_backoff_until {
+            if now < t {
+                let prev = self.state;
+                self.state = State::Idle;
+                self.publish_state(prev);
+                return;
+            }
+            self.start_failure_backoff_until = None;
+        }
+
+        let demand = Demand {
+            consumers_present: !self.consumers.is_empty(),
+            gui_preview_active: self.gui_preview_active,
+        };
+
+        let next = next_state(self.state, demand, now);
+
+        // Side effects only fire when the *category* of state changes
+        // (Idle/Activating/Live/Deactivating), not on every tick.
+        let entered_live = matches!(next, State::Live) && !matches!(self.state, State::Live);
+        let exited_live = !matches!(next, State::Live) && matches!(self.state, State::Live);
+
+        if entered_live {
+            match self.start_source() {
+                Ok(()) => {
+                    self.start_failure_count = 0;
+                    self.start_failure_backoff_until = None;
+                }
+                Err(e) => {
+                    log::error!("could not start source pipeline: {e:#}");
+                    // Exponential backoff: 2, 4, 8, 16, 32 s capped.
+                    self.start_failure_count = self.start_failure_count.saturating_add(1).min(5);
+                    let delay = Duration::from_secs(2u64.pow(self.start_failure_count));
+                    self.start_failure_backoff_until = Some(now + delay);
+                    log::warn!(
+                        "source-pipeline retry suppressed for {:?} (failure #{})",
+                        delay,
+                        self.start_failure_count,
+                    );
+                    let prev = self.state;
+                    self.state = State::Idle;
+                    self.publish_state(prev);
+                    return;
+                }
+            }
+        }
+        if exited_live {
+            self.stop_source();
+            // RVM / smoother carry inter-frame state; reset so the next
+            // engagement starts clean instead of with stale gradients.
+            // The bg plate is dropped too — lighting and camera
+            // position may have changed during the idle window, and
+            // the EMA reconverges within ~1 s of being live again.
+            self.segmenter.reset();
+            self.smoother.reset();
+            self.anchor_lock.reset();
+            self.compositor.reset_bg_plate();
+            // Drop the inference cache so the next engagement re-infers on
+            // its first frame instead of compositing a mask from the last
+            // call against a fresh, unrelated scene.
+            self.cached_mask = None;
+            self.cached_framing = None;
+            self.infer_tick = 0;
+            // The next pump_idle_frame tick will overwrite idle_frame
+            // with a fresh loader render, wiping the last-call image.
+            self.last_idle_push = None;
+        }
+
+        let prev = self.state;
+        self.state = next;
+        self.publish_state(prev);
+    }
+
+    fn start_source(&mut self) -> Result<()> {
+        // Codec policy: reuse the codec resolved by a previous engagement
+        // (also the path when `LB_FORCE_RAW` pinned `Raw` up-front);
+        // otherwise try MJPEG first, then raw. MJPEG is dramatically
+        // faster on bandwidth-limited USB cameras (e.g. C920 720p: 30 fps
+        // MJPEG vs 10 fps raw), so we prefer it whenever the camera can
+        // negotiate it.
+        let attempts: &[SourceCodec] = match self.resolved_codec {
+            Some(SourceCodec::Mjpeg) => &[SourceCodec::Mjpeg],
+            Some(SourceCodec::Raw) => &[SourceCodec::Raw],
+            None => &[SourceCodec::Mjpeg, SourceCodec::Raw],
+        };
+
+        let mut last_err = None;
+        for &codec in attempts {
+            match self.try_start_source(codec) {
+                Ok((pipeline, appsink)) => {
+                    self.resolved_codec = Some(codec);
+                    log::info!(
+                        "source camera engaged via {} ({} → composite → /dev/video10)",
+                        codec.label(),
+                        self.cfg.source_device
+                    );
+                    log_negotiated_input(&appsink);
+                    // Capture the camera's native format for the GUI footer.
+                    self.capture_info =
+                        capture_dims(&pipeline).map(|(width, height)| CaptureInfo {
+                            width,
+                            height,
+                            codec,
+                        });
+                    // Restart the fps window so the first measurement reflects
+                    // this engagement, not the gap since the last one.
+                    self.fps_win_start = Instant::now();
+                    self.fps_win_frames = 0;
+                    self.telemetry_dirty = true;
+                    self.source = Some((pipeline, appsink));
+                    return Ok(());
+                }
+                Err(e) => {
+                    if attempts.len() > 1 {
+                        log::warn!(
+                            "source camera could not engage via {} ({e:#}); trying next codec",
+                            codec.label(),
+                        );
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no source codec attempted")))
+    }
+
+    /// Build the source graph for `codec`, drive it to PLAYING, and block
+    /// until the state change completes so a negotiation failure (e.g. a
+    /// camera without MJPEG) surfaces synchronously as an `Err` we can
+    /// fall back from. On failure the half-built graph is torn down to
+    /// PLAYING so it releases `/dev/video0` before the next attempt.
+    fn try_start_source(&self, codec: SourceCodec) -> Result<(gst::Pipeline, gst_app::AppSink)> {
+        let (pipeline, appsink) = (self.source_builder)(&self.cfg, codec)?;
+        pipeline
+            .set_state(gst::State::Playing)
+            .context("source pipeline → Playing")?;
+        // Wait for the PLAYING transition to resolve. A live v4l2src that
+        // can't satisfy the requested caps fails here rather than on the
+        // bus, letting us fall back to the next codec deterministically.
+        let (res, _, _) = pipeline.state(gst::ClockTime::from_seconds(2));
+        if let Err(e) = res {
+            let _ = pipeline.set_state(gst::State::Null);
+            let _ = pipeline.state(gst::ClockTime::from_seconds(1));
+            return Err(anyhow::Error::new(e).context(format!(
+                "source pipeline did not reach Playing ({})",
+                codec.label()
+            )));
+        }
+        Ok((pipeline, appsink))
+    }
+
+    fn stop_source(&mut self) {
+        if let Some((pipeline, _)) = self.source.take() {
+            let _ = pipeline.set_state(gst::State::Null);
+            // `set_state(Null)` returns `Async` for any pipeline that
+            // owns a real device — it queues the state change but the
+            // v4l2src fd may still be live for a few frames. Without
+            // this synchronous wait, dropping `pipeline` here lets the
+            // next `start_source` race the kernel and get EBUSY on
+            // /dev/video0. 1 s is generous; v4l2 release is normally
+            // a few ms.
+            let _ = pipeline.state(gst::ClockTime::from_seconds(1));
+            log::info!("source camera released ({})", self.cfg.source_device);
+        }
+        // Drop telemetry so the GUI doesn't show stale fps/capture once the
+        // camera is released.
+        self.live_fps = None;
+        self.capture_info = None;
+        self.fps_win_frames = 0;
+        self.telemetry_dirty = true;
+    }
+
+    fn shutdown(&mut self) {
+        self.stop_source();
+        // Push EOS into the sink so any consumers see a clean end.
+        let _ = self.sink_appsrc.end_of_stream();
+    }
+
+    /// Refresh the public `PipelineState` and log a transition line.
+    /// Skips the mutex write and clone when neither the state-machine
+    /// state nor the consumer set has changed since the last publish —
+    /// avoids ~30 redundant lock+clone ops/sec while Live.
+    fn publish_state(&mut self, prev: State) {
+        let state_changed = std::mem::discriminant(&prev) != std::mem::discriminant(&self.state);
+        let pids_now: HashSet<u32> = self.consumers.iter().map(|c| c.pid).collect();
+        let consumers_changed = pids_now != self.last_published_pids;
+        // `telemetry_dirty` lets ~1×/s fps updates (and the one-shot capture
+        // read) through; without it the dedup below would suppress them.
+        if !state_changed && !consumers_changed && !self.telemetry_dirty {
+            return;
+        }
+
+        let label: &'static str = match self.state {
+            State::Idle => "idle",
+            State::Activating { .. } => "activating",
+            State::Live => "live",
+            State::Deactivating { .. } => "deactivating",
+        };
+        if self.last_state_log != Some(label) {
+            let consumer_summary = self
+                .consumers
+                .iter()
+                .map(|c| format!("{}({})", c.name, c.pid))
+                .collect::<Vec<_>>()
+                .join(",");
+            log::info!(
+                "lazy state → {label} (consumers=[{consumer_summary}], gui_preview={})",
+                self.gui_preview_active,
+            );
+            self.last_state_log = Some(label);
+        }
+        let public = match self.state {
+            State::Live => PipelineState::Live {
+                consumers: self.consumers.clone(),
+                fps: self.live_fps,
+                capture: self.capture_info.clone(),
+            },
+            // Activating/Deactivating both look "Idle-ish" to the GUI; we
+            // only flip the public state when frames are actually flowing.
+            _ => PipelineState::Idle,
+        };
+        if let Ok(mut slot) = self.state_pub.lock() {
+            *slot = public;
+        }
+        self.last_published_pids = pids_now;
+        self.telemetry_dirty = false;
+    }
+
+    /// Compute the auto-frame transform from a freshly segmented mask.
+    /// Returns `None` when framing is off or `AnchorLock` hasn't engaged
+    /// yet. Pulled out of `pump_one_frame` so the cached-mask path can
+    /// recompute framing only when inference actually runs.
+    fn compute_framing(&mut self, mask: &Mask) -> Option<Framing> {
+        if !self.framing_enabled {
+            return None;
+        }
+        let frame_w_f = self.cfg.width as f32;
+        let frame_h_f = self.cfg.height as f32;
+        let frame_idx = self.frame_idx;
+        let framerate = self.cfg.framerate as u64;
+        self.anchor_lock.update(mask).map(|anchor| {
+            let center_x = frame_w_f * 0.5;
+            let raw_src_x = anchor.cx_norm * frame_w_f;
+
+            // Adaptive zoom: pick the smallest zoom that both meets the
+            // FG_ZOOM minimum and keeps the recentred crop window strictly
+            // inside [0, frame_w]. Centred user → 1.05×; off-centre user →
+            // bumps just enough to recentre cleanly. Capped at FG_ZOOM_MAX
+            // so the wall doesn't visibly zoom for users sitting near the
+            // edge — at the cap, src_x gets clamped instead and the user
+            // appears slightly off-centre but in frame.
+            let dist_to_nearer_edge = raw_src_x.min(frame_w_f - raw_src_x).max(0.0);
+            let required_zoom = if dist_to_nearer_edge > 0.5 {
+                center_x / dist_to_nearer_edge
+            } else {
+                FG_ZOOM_MAX
+            };
+            let zoom = required_zoom.clamp(FG_ZOOM, FG_ZOOM_MAX);
+            let half_crop_w = center_x / zoom;
+            let src_x = raw_src_x.clamp(half_crop_w, frame_w_f - half_crop_w);
+
+            // Vertical: place head at TOP_HEADROOM, but never higher than
+            // what's needed to keep the source bottom mapped to (at least)
+            // the output bottom. Uses the dynamic zoom so the headroom math
+            // agrees with the horizontal crop sizing.
+            let src_y = anchor.top_y_norm * frame_h_f;
+            let min_dst_y = frame_h_f - (frame_h_f - src_y) * zoom;
+            let dst_y = (frame_h_f * TOP_HEADROOM).max(min_dst_y);
+
+            let f = Framing {
+                src_anchor_x: src_x,
+                src_anchor_y: src_y,
+                dst_anchor_x: center_x,
+                dst_anchor_y: dst_y,
+                zoom,
+            };
+            if frame_idx == 1 || frame_idx.is_multiple_of(framerate * 2) {
+                log::debug!(
+                    "auto-frame: cx={:.3} top_y={:.3} zoom={:.2}",
+                    anchor.cx_norm,
+                    anchor.top_y_norm,
+                    f.zoom,
+                );
+            }
+            f
+        })
+    }
+
+    /// Pull one sample from the source appsink (with a short timeout),
+    /// produce a mask (segment or reuse the cache per `infer_interval`),
+    /// composite, and push the result into the sink appsrc. No-op if the
+    /// pull times out (camera lag).
+    fn pump_one_frame(&mut self) {
+        let t_start = Instant::now();
+        let appsink = match self.source.as_ref() {
+            Some((_, s)) => s.clone(),
+            None => return,
+        };
+
+        let sample = match appsink.try_pull_sample(gst::ClockTime::from_mseconds(33)) {
+            Some(s) => s,
+            None => return,
+        };
+        let buffer = match sample.buffer() {
+            Some(b) => b,
+            None => return,
+        };
+        let map = match buffer.map_readable() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+
+        let mut frame_rgba = map.as_slice().to_vec();
+        drop(map);
+        let frame_w = self.cfg.width;
+        let frame_h = self.cfg.height;
+        let bg = self.background.clone();
+        let t_pull = t_start.elapsed();
+
+        let mut segment_dur: Option<Duration> = None;
+        let t_comp_start;
+
+        // Segmentation runs whenever there's bg work to do (any non-None
+        // bg) OR auto-frame needs the silhouette anchor (any mode). In
+        // `Background::None + framing` the compositor crops the raw camera
+        // frame around the locked centroid — the mask is only there so
+        // `AnchorLock` has something to lock onto.
+        if !matches!(bg, Background::None) || self.framing_enabled {
+            // Infer on a 1-in-N cadence; the first frame of an engagement
+            // (cache empty) always infers regardless of the interval.
+            let do_infer =
+                self.cached_mask.is_none() || self.infer_tick.is_multiple_of(self.infer_interval);
+            self.infer_tick = self.infer_tick.wrapping_add(1);
+
+            if do_infer {
+                let t_seg = Instant::now();
+                let segment =
+                    self.segmenter
+                        .segment(&frame_rgba, frame_w as usize, frame_h as usize);
+                match segment {
+                    Ok(mut mask) => {
+                        self.smoother.smooth(&mut mask.data);
+                        segment_dur = Some(t_seg.elapsed());
+                        self.cached_framing = self.compute_framing(&mask);
+                        self.cached_mask = Some(mask);
+                    }
+                    Err(gpu_error) if self.segmenter.backend() == Backend::Gpu => {
+                        let technical_reason = format!("{gpu_error:#}");
+                        let user_reason = format!(
+                            "GPU acceleration was disabled after an inference error; LinuxBroadcast is now using CPU. {technical_reason}"
+                        );
+                        log::warn!(
+                            "{user_reason} To restore GPU acceleration, install an ONNX Runtime CUDA provider built for this GPU."
+                        );
+
+                        if let Err(cpu_error) = self.segmenter.fall_back_to_cpu(self.model_onnx) {
+                            log::error!(
+                                "GPU inference failed ({technical_reason}); CPU fallback could not start: {cpu_error:#}"
+                            );
+                            return;
+                        }
+                        if let Ok(mut backend) = self.backend_pub.lock() {
+                            *backend = Backend::Cpu;
+                        }
+                        if let Ok(mut reason) = self.gpu_fallback_pub.lock() {
+                            *reason = Some(user_reason);
+                        }
+
+                        // The GPU error left the recurrent state unusable, so
+                        // run this very frame again against the clean CPU
+                        // session. From here on every inference stays on CPU.
+                        match self.segmenter.segment(
+                            &frame_rgba,
+                            frame_w as usize,
+                            frame_h as usize,
+                        ) {
+                            Ok(mut mask) => {
+                                self.smoother.smooth(&mut mask.data);
+                                segment_dur = Some(t_seg.elapsed());
+                                self.cached_framing = self.compute_framing(&mask);
+                                self.cached_mask = Some(mask);
+                            }
+                            Err(cpu_error) => {
+                                log::error!(
+                                    "GPU inference failed ({technical_reason}); CPU retry also failed: {cpu_error:#}"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("segment: {e:#}");
+                        return;
+                    }
+                }
+            }
+
+            // Composite the fresh camera frame against the latest mask —
+            // on skipped ticks that mask is up to `infer_interval - 1`
+            // frames old, so the foreground moves at full FPS while the
+            // silhouette edge lags slightly during motion.
+            t_comp_start = Instant::now();
+            if let Some(mask) = self.cached_mask.as_ref() {
+                let framing = self.cached_framing;
+                if let Err(e) =
+                    self.compositor
+                        .composite(&mut frame_rgba, frame_w, frame_h, mask, &bg, framing)
+                {
+                    log::error!("composite: {e:#}");
+                    return;
+                }
+            }
+        } else {
+            // Pure passthrough: keep recurrent state clean and drop the
+            // cache so the next non-trivial engagement re-infers at once.
+            self.smoother.reset();
+            self.segmenter.reset();
+            self.cached_mask = None;
+            self.cached_framing = None;
+            self.infer_tick = 0;
+            t_comp_start = Instant::now();
+        }
+        let t_composite = t_comp_start.elapsed();
+
+        let t_push_start = Instant::now();
+        if self.preview_enabled
+            && let Some(tx) = &self.preview_tx
+        {
+            // try_send so we silently drop when the GUI lags.
+            let _ = tx.try_send(PreviewFrame {
+                width: frame_w,
+                height: frame_h,
+                rgba: frame_rgba.clone(),
+            });
+        }
+
+        let pushed = self.push_to_sink(&frame_rgba);
+        let t_push = t_push_start.elapsed();
+        if pushed
+            && (self.frame_idx == 1 || self.frame_idx.is_multiple_of(self.cfg.framerate as u64))
+        {
+            log::debug!(
+                "live frame #{} ({}x{} RGBA) → /dev/video sink",
+                self.frame_idx,
+                frame_w,
+                frame_h,
+            );
+        }
+
+        // Reset the idle-push throttle so the next tick after we drop
+        // out of Live re-pushes the loader immediately — no visible gap
+        // on the consumer side.
+        if pushed {
+            self.last_idle_push = None;
+            self.tick_fps_meter();
+        }
+
+        self.profiler
+            .record(t_pull, segment_dur, t_composite, t_push, t_start.elapsed());
+    }
+
+    /// Count one output frame and, once per ~1 s window, recompute the
+    /// measured output framerate published to the GUI. Always-on and cheap;
+    /// independent of the `LB_PROFILE`-gated `Profiler`.
+    fn tick_fps_meter(&mut self) {
+        self.fps_win_frames += 1;
+        let elapsed = self.fps_win_start.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            self.live_fps = Some(self.fps_win_frames as f32 / elapsed.as_secs_f32());
+            self.fps_win_start = Instant::now();
+            self.fps_win_frames = 0;
+            self.telemetry_dirty = true;
+        }
+    }
+
+    /// Render the next loader frame (dark bg + logo + rotating spinner)
+    /// and push it to the sink. Throttled to `IDLE_PUSH_INTERVAL` so a
+    /// fast idle tick doesn't burn CPU. The output is also forwarded to
+    /// the GUI preview channel so the preview pane mirrors what
+    /// `/dev/video10` consumers see, instead of sitting on its own
+    /// "no frames yet" placeholder.
+    fn pump_idle_frame(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_idle_push
+            && now.duration_since(last) < IDLE_PUSH_INTERVAL
+        {
+            return;
+        }
+
+        // Take the scratch buffer out, render into it, push, put it
+        // back — keeps one heap allocation across pushes while still
+        // letting `push_to_sink` borrow `&mut self`.
+        let mut frame = self.idle_frame.take().unwrap_or_default();
+        self.idle_loader.render(&mut frame);
+
+        if self.preview_enabled
+            && let Some(tx) = &self.preview_tx
+        {
+            let _ = tx.try_send(PreviewFrame {
+                width: self.cfg.width,
+                height: self.cfg.height,
+                rgba: frame.clone(),
+            });
+        }
+
+        let _ = self.push_to_sink(&frame);
+        self.idle_frame = Some(frame);
+        self.last_idle_push = Some(now);
+    }
+
+    /// Wrap an RGBA frame in a fresh GStreamer buffer with the next PTS,
+    /// push it to the sink appsrc, bump `frame_idx`. Returns false if
+    /// allocation, mapping, or the push itself failed — caller decides
+    /// whether to retry / log.
+    fn push_to_sink(&mut self, rgba: &[u8]) -> bool {
+        let fps = self.cfg.framerate as u64;
+        let mut out = match gst::Buffer::with_size(rgba.len()) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        {
+            let out_mut = match out.get_mut() {
+                Some(m) => m,
+                None => return false,
+            };
+            let pts = gst::ClockTime::from_nseconds(self.frame_idx * NS_PER_SEC / fps);
+            out_mut.set_pts(pts);
+            out_mut.set_duration(gst::ClockTime::from_nseconds(NS_PER_SEC / fps));
+            let mut wmap = match out_mut.map_writable() {
+                Ok(w) => w,
+                Err(_) => return false,
+            };
+            wmap.copy_from_slice(rgba);
+        }
+        self.frame_idx += 1;
+        if let Err(e) = self.sink_appsrc.push_buffer(out) {
+            log::warn!("sink appsrc push_buffer: {e}");
+            return false;
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn demand(consumers: bool, preview: bool) -> Demand {
+        Demand {
+            consumers_present: consumers,
+            gui_preview_active: preview,
+        }
+    }
+
+    /// Drive `next_state` through a sequence of (Δt, Demand) steps,
+    /// returning the final state. Useful for asserting end-state across
+    /// a synthetic timeline without booting any GStreamer machinery.
+    fn run(start: State, steps: &[(Duration, Demand)]) -> State {
+        let mut now = Instant::now();
+        let mut state = start;
+        for (dt, d) in steps {
+            now += *dt;
+            state = next_state(state, *d, now);
+        }
+        state
+    }
+
+    #[test]
+    fn idle_with_no_demand_stays_idle() {
+        let off = demand(false, false);
+        let final_state = run(State::Idle, &[(Duration::from_secs(1), off); 10]);
+        assert!(matches!(final_state, State::Idle));
+    }
+
+    #[test]
+    fn brief_consumer_under_2s_never_lights_camera() {
+        // Demand on for 1.5 s, then off. Must never reach Live.
+        let on = demand(true, false);
+        let off = demand(false, false);
+        let mut state = State::Idle;
+        let mut now = Instant::now();
+        // 1.5 seconds of demand asserted.
+        let end_on = now + Duration::from_millis(1500);
+        while now < end_on {
+            now += Duration::from_millis(50);
+            state = next_state(state, on, now);
+            assert!(
+                !matches!(state, State::Live),
+                "must not reach Live within activation debounce"
+            );
+        }
+        // Then demand off — must transition straight back to Idle.
+        for _ in 0..20 {
+            now += Duration::from_millis(50);
+            state = next_state(state, off, now);
+            assert!(!matches!(state, State::Live));
+        }
+        assert!(matches!(state, State::Idle));
+    }
+
+    #[test]
+    fn consumer_held_2s_reaches_live() {
+        // With demand asserted continuously, we should reach Live at
+        // exactly the activation-debounce boundary.
+        let on = demand(true, false);
+        let t0 = Instant::now();
+        let mut state = State::Idle;
+
+        // Just before the boundary: still Activating.
+        let before = t0 + ACTIVATION_DEBOUNCE - Duration::from_millis(50);
+        state = next_state(state, on, t0);
+        state = next_state(state, on, before);
+        assert!(matches!(state, State::Activating { .. }));
+
+        // At the boundary: Live.
+        let at = t0 + ACTIVATION_DEBOUNCE;
+        state = next_state(state, on, at);
+        assert!(matches!(state, State::Live));
+    }
+
+    #[test]
+    fn live_then_no_demand_for_3s_returns_idle() {
+        let on = demand(true, false);
+        let off = demand(false, false);
+        let t0 = Instant::now();
+
+        // 3 s off → Idle.
+        let mut s = State::Live;
+        s = next_state(s, off, t0);
+        assert!(matches!(s, State::Deactivating { .. }));
+        s = next_state(s, off, t0 + DEACTIVATION_DEBOUNCE);
+        assert!(matches!(s, State::Idle));
+
+        // 2.5 s off then on → must stay Live.
+        let t1 = Instant::now();
+        let mut s2 = State::Live;
+        s2 = next_state(s2, off, t1);
+        s2 = next_state(s2, off, t1 + Duration::from_millis(2500));
+        assert!(matches!(s2, State::Deactivating { .. }));
+        s2 = next_state(s2, on, t1 + Duration::from_millis(2600));
+        assert!(matches!(s2, State::Live));
+    }
+
+    #[test]
+    fn flicker_during_deactivation_stays_live() {
+        // Live, demand toggles off/on/off/on at 1 s each — never crosses
+        // the 3 s deactivation boundary, so must never leave Live.
+        let on = demand(true, false);
+        let off = demand(false, false);
+        let t0 = Instant::now();
+        let mut s = State::Live;
+        s = next_state(s, off, t0);
+        s = next_state(s, on, t0 + Duration::from_secs(1));
+        assert!(matches!(s, State::Live));
+        s = next_state(s, off, t0 + Duration::from_secs(2));
+        s = next_state(s, on, t0 + Duration::from_secs(3));
+        assert!(matches!(s, State::Live));
+    }
+
+    #[test]
+    fn gui_preview_alone_holds_live() {
+        // Preview pane visible counts as a synthetic consumer in the
+        // demand signal, so it should drive Idle → Live on its own.
+        let preview = demand(false, true);
+        let t0 = Instant::now();
+        let mut s = State::Idle;
+        s = next_state(s, preview, t0);
+        s = next_state(s, preview, t0 + ACTIVATION_DEBOUNCE);
+        assert!(matches!(s, State::Live));
+    }
+}

@@ -1,0 +1,40 @@
+[package]
+name = "lb-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Webcam → segmentation → composite → v4l2loopback pipeline for linux-broadcast"
+publish = false
+
+[lib]
+name = "lb_pipeline"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+gstreamer-video.workspace = true
+
+ort.workspace = true
+fast_image_resize.workspace = true
+
+crossbeam-channel.workspace = true
+
+[features]
+# Optional NVIDIA GPU acceleration via ort's CUDA execution provider.
+# Off by default — default builds stay pure-CPU with no extra runtime deps.
+cuda = ["ort/cuda"]
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+image.workspace = true
+env_logger.workspace = true
+
+[lints]
+workspace = true

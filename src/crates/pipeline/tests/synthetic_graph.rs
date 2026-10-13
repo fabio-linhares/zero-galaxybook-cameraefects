@@ -1,0 +1,349 @@
+//! Synthetic-graph integration tests.
+//!
+//! These tests build a `Pipeline` against substitute source/sink
+//! builders so the pipeline can run without `/dev/video0` or
+//! `v4l2loopback`. The source becomes `videotestsrc → videoconvert →
+//! capsfilter(RGBA, WxH) → appsink` and the sink becomes `appsrc →
+//! capsfilter(RGBA, WxH, fps) → appsink` — the feeder still does
+//! segmentation (skipped for `Background::None`) and pushes to the sink
+//! exactly the way it would in production.
+//!
+//! Requires `libgstreamer1.0-dev` + `gstreamer1.0-plugins-good` for
+//! `videotestsrc`. No v4l2loopback needed.
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
+use lb_pipeline::pipeline::{SinkBuilder, SourceBuilder, SourceCodec};
+use lb_pipeline::{Background, Command, Pipeline, PipelineConfig, PipelineState};
+
+// Real model bytes — these tests only run with `Background::None`, so
+// the feeder short-circuits before invoking the segmenter, but
+// Segmenter::from_bytes still runs at thread spawn (loads the ONNX
+// session) and needs valid bytes. We embed the same models the app
+// embeds; the path is workspace-relative.
+const MODEL_MULTICLASS_ONNX: &[u8] = include_bytes!("../../../models/selfie_multiclass.onnx");
+const MODEL_RVM_ONNX: &[u8] = include_bytes!("../../../models/rvm.onnx");
+
+fn cfg() -> PipelineConfig {
+    PipelineConfig {
+        source_device: "synthetic".to_string(),
+        sink_device: "synthetic".to_string(),
+        width: 320,
+        height: 240,
+        framerate: 30,
+        background: Background::None,
+        model: lb_pipeline::ModelKind::SelfieMulticlass,
+        preview_tx: None,
+        framing: false,
+    }
+}
+
+/// `videotestsrc → videoconvert → capsfilter(RGBA, WxH) → appsink`.
+/// The codec arg is ignored — `videotestsrc` always produces raw frames.
+fn synthetic_source() -> SourceBuilder {
+    Arc::new(
+        |cfg: &PipelineConfig, _codec: SourceCodec| -> Result<(gst::Pipeline, gst_app::AppSink)> {
+            let pipeline = gst::Pipeline::new();
+            let src = gst::ElementFactory::make("videotestsrc")
+                .property_from_str("pattern", "ball")
+                .property("is-live", true)
+                .build()?;
+            let convert = gst::ElementFactory::make("videoconvert").build()?;
+            let caps = gst::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .field("width", cfg.width as i32)
+                .field("height", cfg.height as i32)
+                .build();
+            let capsfilter = gst::ElementFactory::make("capsfilter")
+                .property("caps", &caps)
+                .build()?;
+            let appsink = gst_app::AppSink::builder()
+                .caps(&caps)
+                .max_buffers(2)
+                .drop(true)
+                .sync(false)
+                .build();
+            pipeline.add_many([
+                &src,
+                &convert,
+                &capsfilter,
+                appsink.upcast_ref::<gst::Element>(),
+            ])?;
+            gst::Element::link_many([
+                &src,
+                &convert,
+                &capsfilter,
+                appsink.upcast_ref::<gst::Element>(),
+            ])?;
+            Ok((pipeline, appsink))
+        },
+    )
+}
+
+/// `appsrc → capsfilter(RGBA, WxH, fps) → appsink`. The terminal appsink
+/// is what the test pulls from to verify frames arrive end-to-end. We
+/// stash a clone of it on the side via a closure-captured Mutex so the
+/// caller can pull samples after `Pipeline::start_with_builders` returns.
+fn synthetic_sink(captured_sink: Arc<Mutex<Option<gst_app::AppSink>>>) -> SinkBuilder {
+    Arc::new(
+        move |cfg: &PipelineConfig| -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+            let pipeline = gst::Pipeline::new();
+            let appsrc_caps = gst::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .field("width", cfg.width as i32)
+                .field("height", cfg.height as i32)
+                .field("framerate", gst::Fraction::new(cfg.framerate as i32, 1))
+                .build();
+            let appsrc = gst_app::AppSrc::builder()
+                .caps(&appsrc_caps)
+                .format(gst::Format::Time)
+                .is_live(true)
+                .build();
+            let appsink = gst_app::AppSink::builder()
+                .caps(&appsrc_caps)
+                .max_buffers(8)
+                .drop(false)
+                .sync(false)
+                .build();
+            pipeline.add_many([
+                appsrc.upcast_ref::<gst::Element>(),
+                appsink.upcast_ref::<gst::Element>(),
+            ])?;
+            gst::Element::link_many([
+                appsrc.upcast_ref::<gst::Element>(),
+                appsink.upcast_ref::<gst::Element>(),
+            ])?;
+            *captured_sink.lock().unwrap() = Some(appsink);
+            Ok((pipeline, appsrc))
+        },
+    )
+}
+
+/// Like [`synthetic_source`] but fails when asked for MJPEG — emulates a
+/// raw-only camera so the feeder's codec policy must fall back to raw.
+fn raw_only_source() -> SourceBuilder {
+    let inner = synthetic_source();
+    Arc::new(move |cfg: &PipelineConfig, codec: SourceCodec| {
+        if codec == SourceCodec::Mjpeg {
+            anyhow::bail!("synthetic camera does not support MJPEG");
+        }
+        inner(cfg, codec)
+    })
+}
+
+fn start_pipeline(cfg: PipelineConfig) -> (Pipeline, Arc<Mutex<Option<gst_app::AppSink>>>) {
+    start_pipeline_with_source(cfg, synthetic_source())
+}
+
+fn start_pipeline_with_source(
+    cfg: PipelineConfig,
+    source: SourceBuilder,
+) -> (Pipeline, Arc<Mutex<Option<gst_app::AppSink>>>) {
+    let captured = Arc::new(Mutex::new(None));
+    let p = Pipeline::start_with_builders(
+        cfg,
+        MODEL_MULTICLASS_ONNX,
+        MODEL_RVM_ONNX,
+        source,
+        synthetic_sink(captured.clone()),
+    )
+    .expect("start_with_builders");
+    (p, captured)
+}
+
+fn pull_frames_for(sink: &gst_app::AppSink, duration: Duration) -> usize {
+    let deadline = Instant::now() + duration;
+    let mut count = 0;
+    while Instant::now() < deadline {
+        if sink
+            .try_pull_sample(gst::ClockTime::from_mseconds(50))
+            .is_some()
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+#[test]
+fn pipeline_emits_frames_with_videotestsrc() {
+    let mut c = cfg();
+    c.background = Background::None;
+    let (p, captured) = start_pipeline(c);
+
+    // The GUI-preview heartbeat lights the synthetic camera. The
+    // activation debounce is 2 s; pull for slightly longer to ensure we
+    // land in Live and see real source frames flowing through, not just
+    // idle re-pushes.
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
+    let sink = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("sink builder must have been called");
+
+    // Drain idle re-pushes during the activation debounce window.
+    let _ = pull_frames_for(&sink, Duration::from_millis(2200));
+    // The feeder's outer select! is paced by IDLE_TICK = 100ms, so even
+    // with a 30 fps source we expect ~10 fps end-to-end. Measure over
+    // 2 s and require at least 12 frames — a comfortable margin over
+    // the idle-push rate (5 fps) so a bug that fails to actually
+    // transition into Live would be caught.
+    let live_count = pull_frames_for(&sink, Duration::from_millis(2000));
+    assert!(
+        live_count >= 12,
+        "expected ≥12 Live frames in 2s, got {live_count}",
+    );
+
+    p.stop();
+}
+
+#[test]
+fn lazy_state_walks_idle_to_live_to_idle() {
+    let c = cfg();
+    let (p, _captured) = start_pipeline(c);
+
+    // Initial state: Idle.
+    assert!(matches!(p.state(), PipelineState::Idle));
+
+    // Assert demand → state should reach Live within activation
+    // debounce + slack.
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
+    let live_deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < live_deadline {
+        if matches!(p.state(), PipelineState::Live { .. }) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        matches!(p.state(), PipelineState::Live { .. }),
+        "expected Live within 4s",
+    );
+
+    // Drop demand → must return to Idle within deactivation debounce +
+    // slack.
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(false))
+        .unwrap();
+    let idle_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < idle_deadline {
+        if matches!(p.state(), PipelineState::Idle) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(matches!(p.state(), PipelineState::Idle));
+
+    p.stop();
+}
+
+/// `stop()` then `drop()` must be clean and idempotent: `Pipeline::stop`
+/// runs explicitly on GUI Quit, then `drop` re-asserts the same teardown.
+#[test]
+fn shutdown_after_live_is_clean_and_idempotent() {
+    let c = cfg();
+    let (p, captured) = start_pipeline(c);
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
+    let sink = captured.lock().unwrap().clone().unwrap();
+    // Drive into Live so feeder is actively running source + composite.
+    let _ = pull_frames_for(&sink, Duration::from_millis(2200));
+    assert!(matches!(p.state(), PipelineState::Live { .. }));
+
+    // Repeated stops mirror App::shutdown_cleanup → Drop, which calls
+    // stop() twice in effect. Must not panic, must not deadlock.
+    p.stop();
+    p.stop();
+
+    // Drop must complete promptly (Pipeline::Drop has a 2s join timeout
+    // on the feeder; we give the whole thing 5s headroom).
+    let start = Instant::now();
+    drop(p);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "Pipeline::drop took {:?} — feeder failed to join",
+        start.elapsed(),
+    );
+}
+
+#[test]
+fn set_background_no_frame_gap() {
+    // While Live with a synthetic source, swap backgrounds and verify
+    // the sink keeps emitting frames with no extended gap. (Replaces
+    // the original "source pipeline pointer unchanged" check, which
+    // would have coupled to internals.)
+    let mut c = cfg();
+    c.background = Background::None;
+    let (p, captured) = start_pipeline(c);
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
+    let sink = captured.lock().unwrap().clone().unwrap();
+
+    // Wait through activation debounce.
+    let _ = pull_frames_for(&sink, Duration::from_millis(2200));
+
+    // Now run a sequence of background swaps and count frames pulled.
+    // With None we skip segmentation entirely; with Blur we run
+    // segmentation per frame. Both modes must keep producing frames at
+    // roughly the configured framerate. The 1200ms window leaves slack
+    // for shared-CPU CI runners — the first Blur tick pays for cold
+    // ORT model warmup and a cold instruction cache.
+    for bg in [
+        Background::None,
+        Background::Blur { strength: 0.5 },
+        Background::None,
+    ] {
+        p.cmd_sender().send(Command::SetBackground(bg)).unwrap();
+        let n = pull_frames_for(&sink, Duration::from_millis(1200));
+        // The point is that frames keep flowing across the swap — a real
+        // stall yields 0–1. The exact count is at the mercy of a loaded
+        // shared CI runner (RVM CPU inference + cold warmup), so keep the
+        // bar low enough to not flake while still catching a true gap.
+        assert!(
+            n >= 3,
+            "expected ≥3 frames during 1200ms in mode swap, got {n}",
+        );
+    }
+
+    p.stop();
+}
+
+/// When the camera can't negotiate MJPEG, the feeder's codec policy must
+/// fall back to raw and still reach Live. Uses a source builder that
+/// errors on `SourceCodec::Mjpeg` and succeeds on `Raw`.
+#[test]
+fn source_codec_falls_back_to_raw_when_mjpeg_unavailable() {
+    let c = cfg();
+    let (p, captured) = start_pipeline_with_source(c, raw_only_source());
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
+    let sink = captured.lock().unwrap().clone().unwrap();
+
+    // Through the activation debounce, then assert Live was reached via
+    // the raw fallback and frames actually flow.
+    let _ = pull_frames_for(&sink, Duration::from_millis(2200));
+    assert!(
+        matches!(p.state(), PipelineState::Live { .. }),
+        "expected Live via raw fallback after MJPEG failed",
+    );
+    let live_count = pull_frames_for(&sink, Duration::from_millis(2000));
+    assert!(
+        live_count >= 12,
+        "expected ≥12 Live frames in 2s via raw fallback, got {live_count}",
+    );
+
+    p.stop();
+}

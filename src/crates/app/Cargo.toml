@@ -1,0 +1,127 @@
+[package]
+name = "linux-broadcast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Background-replacement virtual webcam for Linux"
+publish = false
+
+default-run = "linux-broadcast"
+
+[[bin]]
+name = "linux-broadcast"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+lb-pipeline = { path = "../pipeline", version = "0.4.0" }
+
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+crossbeam-channel.workspace = true
+directories.workspace = true
+serde.workspace = true
+toml.workspace = true
+glob.workspace = true
+rfd.workspace = true
+image.workspace = true
+fs2 = "0.4"
+
+# System tray icon. On Linux this needs a GTK thread (spawned in tray.rs)
+# because egui/winit don't host GTK natively. Build deps: libgtk-3-dev,
+# libayatana-appindicator3-dev (see README / Debian deps below).
+# default-features = false drops tray-icon's `libxdo` feature: it only
+# powers the predefined Copy/Cut/Paste/SelectAll menu items (which we
+# don't use) and links libxdo.so, whose soname differs across distros
+# (Debian .so.3 vs Arch .so.4), breaking the prebuilt binary on Arch.
+tray-icon = { version = "0.22", default-features = false }
+gtk = "0.18"
+
+# D-Bus activation: the running instance owns a well-known name on the
+# session bus and serves the freedesktop `org.freedesktop.Application`
+# interface; a second launch sends `Activate` to raise the existing
+# window instead of silently exiting on the flock. Blocking API only —
+# zbus 5 hosts its own internal worker so we don't pull in tokio.
+zbus = { version = "5", default-features = false, features = ["blocking-api"] }
+
+# Wayland xdg-activation-v1 client. Pinned to the same versions winit /
+# eframe already pull in so we don't double-link libwayland. The
+# `client_system` feature on `wayland-backend` is what enables
+# `Backend::from_foreign_display` — we share winit's existing wl_display
+# rather than opening a second connection. Used only on the Wayland
+# session path, no-op on X11.
+raw-window-handle = "0.6"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+# libc::_exit for the tray-Quit watchdog. We need to bypass atexit
+# handlers because gstreamer / glib install ones that block on pipeline
+# drain — fine on graceful shutdown, fatal on a force-exit from a
+# stuck egui loop.
+libc = "0.2"
+
+[features]
+# Re-export the pipeline's CUDA feature so `cargo build -p linux-broadcast
+# --features cuda` produces a GPU-capable binary.
+cuda = ["lb-pipeline/cuda"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+# ---------------------------------------------------------------------------
+# Debian packaging — `cargo deb -p linux-broadcast` reads this block.
+#
+# postinst loads v4l2loopback with the options shipped in
+# /etc/modprobe.d/linux-broadcast.conf so /dev/video10 exists immediately,
+# and the modules-load.d drop-in keeps it loaded across reboots. Both files
+# are conffiles, so user edits survive upgrades.
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+name = "linux-broadcast"
+maintainer = "Pedrojok01 <pedrojok@pm.me>"
+copyright = "2025-2026, Pedrojok01"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+LinuxBroadcast is a small virtual webcam that captures your real camera,
+segments the foreground with MediaPipe / RVM on CPU, blurs or replaces
+the background, and exposes the result on /dev/video10 so Zoom, Meet,
+Teams, OBS, Firefox, and Chrome all see it as a regular webcam."""
+section = "video"
+priority = "optional"
+# The shipped binary is the cuda-feature build: it hard-links no CUDA
+# libraries (verified) so it runs pure-CPU when the optional
+# linux-broadcast-cuda provider libs / NVIDIA runtime are absent, and
+# auto-engages the GPU when they are present.
+features = ["cuda"]
+depends = "$auto, v4l2loopback-dkms (>= 0.12.8), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, libayatana-appindicator3-1"
+recommends = "v4l-utils"
+assets = [
+    ["target/release/linux-broadcast", "usr/lib/linux-broadcast/", "755"],
+    ["../../packaging/linux-broadcast.wrapper", "usr/bin/linux-broadcast", "755"],
+    ["../../packaging/LinuxBroadcast.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/LinuxBroadcast.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["../../packaging/linux-broadcast.modprobe.conf", "etc/modprobe.d/linux-broadcast.conf", "644"],
+    ["../../packaging/linux-broadcast.modules-load.conf", "etc/modules-load.d/linux-broadcast.conf", "644"],
+    ["../../README.md", "usr/share/doc/linux-broadcast/README.md", "644"],
+    ["../../models/README.md", "usr/share/doc/linux-broadcast/models/README.md", "644"],
+    ["../../models/Apache-2.0-LICENSE.txt", "usr/share/doc/linux-broadcast/models/Apache-2.0-LICENSE.txt", "644"],
+    ["../../models/RVM-LICENSE.txt", "usr/share/doc/linux-broadcast/models/RVM-LICENSE.txt", "644"],
+    ["../../assets/fonts/Inter-LICENSE.txt", "usr/share/doc/linux-broadcast/fonts/Inter-LICENSE.txt", "644"],
+    ["../../assets/fonts/JetBrainsMono-LICENSE.txt", "usr/share/doc/linux-broadcast/fonts/JetBrainsMono-LICENSE.txt", "644"],
+    ["../../THIRD_PARTY_LICENSES.md", "usr/share/doc/linux-broadcast/THIRD_PARTY_LICENSES.md", "644"],
+]
+maintainer-scripts = "../../packaging/scripts"
+conf-files = [
+    "/etc/modprobe.d/linux-broadcast.conf",
+    "/etc/modules-load.d/linux-broadcast.conf",
+]
