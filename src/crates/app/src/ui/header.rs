@@ -51,10 +51,7 @@ impl App {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(space::LG);
-                        // No tray host (or it failed to install) → keep a
-                        // reachable Quit button in the header so the user
-                        // is never stranded.
-                        if self.tray.is_none() && ghost_button(ui, "Quit").clicked() {
+                        if ghost_button(ui, "Sair").clicked() {
                             self.quit_requested = true;
                             ctx.send_viewport_cmd(ViewportCommand::Close);
                         }

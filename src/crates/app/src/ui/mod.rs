@@ -550,12 +550,11 @@ impl App {
         //     no-op in that case.
         self.handle_activation_events(ctx, frame);
 
-        // 2. Close-button intercept: turn the close request into a hide
-        //    unless `quit_requested` is set (i.e. the tray's Quit just
-        //    fired).
+        // 2. Close-button handling: trigger a real shutdown so camera devices
+        //    (/dev/video0) and CPU/GPU are cleanly released immediately.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.set_visible(ctx, false);
+            self.quit_requested = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
         }
 
         // 3. Read the *compositor-reported* minimized state. Egui has
